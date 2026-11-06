@@ -1,0 +1,219 @@
+# Build Cloudflare workerd for linux-arm64 WITHOUT tcmalloc, so it runs on kernels with a
+# 39-bit user virtual address space (Android/Termux proot, Raspberry Pi OS, ChromeOS Crostini).
+#
+# Why: the npm @cloudflare/workerd-linux-arm64 binaries (every release since 1.20230115.0)
+# statically link tcmalloc, which encodes a memory tag in address bits 42-44 and requires
+# 48-bit VA -> "MmapAligned() failed ... TCMalloc assumes a 48-bit virtual address space".
+# Upstream already has a switch for this (used by its ASAN/TSAN configs):
+#   --@workerd//src/workerd/server:use_tcmalloc=False   -> falls back to the system (glibc) malloc
+#
+# Usage: put this file at .github/workflows/ in a PUBLIC repo (free ubuntu-24.04-arm = 4 vCPU/16 GB;
+# private repos only get 2 vCPU/8 GB and will likely blow the 6 h job limit), then
+# Actions -> "Build workerd arm64 (no tcmalloc)" -> Run workflow. The workerd_ref must equal the
+# workerd version your wrangler pins (wrangler 4.131.1 -> workerd 1.20260911.1 -> tag v1.20260911.1).
+# A cold build is expected to take ~2.5-4 h. If it times out, just "Re-run jobs": the Bazel disk cache
+# is saved even on failure, so the re-run resumes where it stopped.
+#
+# On the phone:
+#   gh run download <run-id> -R <you>/<repo> -n workerd-linux-arm64-notcmalloc-v1.20260911.1 -D ~/workerd-notcmalloc
+#   chmod +x ~/workerd-notcmalloc/workerd
+#   export MINIFLARE_WORKERD_PATH=$HOME/workerd-notcmalloc/workerd
+#   npx wrangler dev
+
+name: Build workerd arm64 (no tcmalloc)
+
+on:
+  workflow_dispatch:
+    inputs:
+      workerd_ref:
+        description: "workerd git tag to build; must match wrangler's pinned workerd (e.g. v1.20261102.1)"
+        required: true
+        default: v1.20261102.1
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      REF: ${{ inputs.workerd_ref }}
+      CACHE_KEY: bazel-arm64-notcmalloc-${{ inputs.workerd_ref }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/julia* || true
+          docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Checkout cloudflare/workerd@${{ inputs.workerd_ref }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: cloudflare/workerd
+          ref: ${{ inputs.workerd_ref }}
+          fetch-depth: 1
+          show-progress: false
+
+      # workerd's own composite action at this exact tag: installs LLVM/clang 19 + lld + libc++ from
+      # apt.llvm.org and appends the matching CC/ld-path lines to .bazelrc. An empty cookie makes Bazel
+      # use the unauthenticated chromium.googlesource.com endpoint (slower, but works).
+      - name: Set up toolchain (workerd's .github/actions/setup-runner)
+        uses: ./.github/actions/setup-runner
+        with:
+          GOOGLESOURCE_COOKIE: ''
+
+      - name: Install bazelisk (honours .bazelversion)
+        run: |
+          # Pinned and checked, not "latest"
+          curl -fsSL -o "$RUNNER_TEMP/bazelisk" \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.30.0/bazelisk-linux-arm64
+          echo "b2bcc040c213b44586b121bda6d983c35df121b917c3a7a66fb16f2fa0df1a4f  $RUNNER_TEMP/bazelisk" | sha256sum -c -
+          sudo install -m 0755 "$RUNNER_TEMP/bazelisk" /usr/local/bin/bazel
+          echo "wanted: $(cat .bazelversion)"; bazel --version
+          nproc; free -g; df -h /
+
+      - name: Restore Bazel disk cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/bazel-disk-cache
+          key: ${{ env.CACHE_KEY }}
+          restore-keys: |
+            bazel-arm64-notcmalloc-${{ inputs.workerd_ref }}-
+            bazel-arm64-notcmalloc-
+
+      # Same flags as upstream's linux-arm64 release job (--config=ci --config=release_linux --strip=always)
+      # minus their private remote cache / -Werror / test configs, plus use_tcmalloc=False.
+      - name: Bazel build //src/workerd/server:workerd (use_tcmalloc=False)
+        timeout-minutes: 320
+        run: |
+          bazel build \
+            --config=ci --config=release_linux --strip=always \
+            --jobs=HOST_CPUS \
+            --@workerd//src/workerd/server:use_tcmalloc=False \
+            //src/workerd/server:workerd
+
+      - name: Save Bazel disk cache (always, so a re-run resumes after a timeout)
+        if: always()
+        run: |
+          # Same trick as upstream: drop >100 MB files (the final binary) to keep the cache small.
+          [ -d ~/bazel-disk-cache ] && find ~/bazel-disk-cache -size +100M -type f -delete || true
+          du -sh ~/bazel-disk-cache || true
+      - if: always()
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/bazel-disk-cache
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Verify binary (no tcmalloc linked)
+        run: |
+          cp bazel-bin/src/workerd/server/workerd "$RUNNER_TEMP/workerd"
+          chmod +x "$RUNNER_TEMP/workerd"
+          ls -la "$RUNNER_TEMP/workerd"
+          readelf -d "$RUNNER_TEMP/workerd" | grep NEEDED
+          if readelf -S "$RUNNER_TEMP/workerd" | grep -q google_malloc; then echo "::error::tcmalloc still linked"; exit 1; fi
+          if strings "$RUNNER_TEMP/workerd" | grep -q MmapAligned; then echo "::error::tcmalloc code present"; exit 1; fi
+          "$RUNNER_TEMP/workerd" --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workerd-linux-arm64-notcmalloc-${{ inputs.workerd_ref }}
+          path: ${{ runner.temp }}/workerd
+          if-no-files-found: error
+          retention-days: 30
+
+      # Emulate the phone: an LD_PRELOAD shim reserves every free gap between 2^39 and 2^48 so all
+      # later mmaps land below 2^39, like a CONFIG_ARM64_VA_BITS_39 kernel. Positive control: the stock
+      # npm binary must die with the same MmapAligned() error seen on the phone.
+      - name: Smoke test under emulated 39-bit address space
+        continue-on-error: true
+        run: |
+          set -u
+          T="$RUNNER_TEMP/t"; mkdir -p "$T/do-data"; cd "$T"
+          cat > va39.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <fcntl.h>
+          #include <stdint.h>
+          #include <sys/mman.h>
+          #include <unistd.h>
+          #ifndef MAP_FIXED_NOREPLACE
+          #define MAP_FIXED_NOREPLACE 0x100000
+          #endif
+          static char buf[1 << 20];
+          static uintptr_t starts[4096], ends[4096];
+          static uintptr_t hex(const char **p) { uintptr_t v = 0; for (;; (*p)++) { char c = **p;
+            if (c >= '0' && c <= '9') v = v * 16 + (c - '0'); else if (c >= 'a' && c <= 'f') v = v * 16 + (c - 'a' + 10); else return v; } }
+          static void reserve(uintptr_t a, uintptr_t b) { if (b > a) mmap((void *)a, b - a, PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0); }
+          __attribute__((constructor(101))) static void va39_init(void) {
+            const uintptr_t lo = (uintptr_t)1 << 39, hi = (uintptr_t)1 << 48;
+            int fd = open("/proc/self/maps", O_RDONLY); if (fd < 0) return;
+            ssize_t n = 0, r; while (n < (ssize_t)sizeof(buf) - 1 && (r = read(fd, buf + n, sizeof(buf) - 1 - n)) > 0) n += r;
+            close(fd); buf[n] = 0; int cnt = 0;
+            for (const char *p = buf; *p && cnt < 4096;) { uintptr_t s = hex(&p); p++; uintptr_t e = hex(&p);
+              starts[cnt] = s; ends[cnt] = e; cnt++; while (*p && *p != '\n') p++; if (*p) p++; }
+            uintptr_t cur = lo;
+            for (int i = 0; i < cnt; i++) { if (ends[i] <= cur) continue; if (starts[i] >= hi) break;
+              reserve(cur, starts[i] < hi ? starts[i] : hi); cur = ends[i]; }
+            reserve(cur, hi);
+          }
+          EOF
+          gcc -O2 -shared -fPIC -o va39.so va39.c
+          export VA39="$T/va39.so"
+
+          echo "== positive control: stock npm build ${REF#v} under the shim (expected to crash)"
+          mkdir -p stock
+          curl -fsSL "$(npm view "@cloudflare/workerd-linux-arm64@${REF#v}" dist.tarball)" \
+            | tar xz -C stock --strip-components=2 package/bin/workerd
+          LD_PRELOAD="$VA39" ./stock/workerd --version > stock.log 2>&1 && echo "stock exit 0" || echo "stock exit $?"
+          head -c 600 stock.log; echo
+          if grep -q MmapAligned stock.log; then echo "OK: emulation reproduces the phone crash"
+          else echo "::warning::emulation did not reproduce the tcmalloc crash; results below are not conclusive"; fi
+
+          echo "== new build under the shim"
+          LD_PRELOAD="$VA39" "$RUNNER_TEMP/workerd" --version
+
+          cat > hello.js <<'EOF'
+          export default { async fetch() { return new Response("hello from workerd\n"); } };
+          EOF
+          cat > sqlite.js <<'EOF'
+          import { DurableObject } from "cloudflare:workers";
+          export class Counter extends DurableObject {
+            constructor(ctx, env) { super(ctx, env);
+              ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS c (id INTEGER PRIMARY KEY, n INTEGER)"); }
+            async fetch() {
+              this.ctx.storage.sql.exec("INSERT INTO c (id, n) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET n = n + 1");
+              return new Response("sqlite count=" + this.ctx.storage.sql.exec("SELECT n FROM c WHERE id = 1").one().n + "\n");
+            }
+          }
+          export default { async fetch(req, env) { return env.COUNTER.get(env.COUNTER.idFromName("x")).fetch(req); } };
+          EOF
+          cat > test.capnp <<EOF
+          using Workerd = import "/workerd/workerd.capnp";
+          const config :Workerd.Config = (
+            services = [ (name = "hello", worker = .hello), (name = "sql", worker = .sql),
+                         (name = "disk", disk = (path = "$T/do-data", writable = true)) ],
+            sockets = [ (name = "h", address = "127.0.0.1:18787", http = (), service = "hello"),
+                        (name = "s", address = "127.0.0.1:18788", http = (), service = "sql") ],
+          );
+          const hello :Workerd.Worker = (
+            modules = [ (name = "worker", esModule = embed "hello.js") ], compatibilityDate = "2025-01-01");
+          const sql :Workerd.Worker = (
+            modules = [ (name = "worker", esModule = embed "sqlite.js") ], compatibilityDate = "2025-01-01",
+            durableObjectNamespaces = [ (className = "Counter", uniqueKey = "counter", enableSql = true) ],
+            durableObjectStorage = (localDisk = "disk"),
+            bindings = [ (name = "COUNTER", durableObjectNamespace = "Counter") ]);
+          EOF
+          LD_PRELOAD="$VA39" "$RUNNER_TEMP/workerd" serve test.capnp > serve.log 2>&1 & P=$!
+          ok=""
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:18787/ && ok=1 && break; sleep 0.5; done
+          curl -sf http://127.0.0.1:18788/ || echo "::warning::SQLite DO request 1 failed"
+          curl -sf http://127.0.0.1:18788/ || echo "::warning::SQLite DO request 2 failed"   # expect count=2
+          echo "workerd mappings created above 2^39 (should only be pre-existing ELF/stack/vdso, no heap):"
+          awk '$2 != "---p" && length($1) > 21 {print}' /proc/$P/maps | head -20 || true
+          kill $P 2>/dev/null || true; wait $P || true
+          cat serve.log
+          [ -n "$ok" ] || { echo "::error::new build did not serve under emulated 39-bit VA"; exit 1; }

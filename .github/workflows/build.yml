@@ -1,24 +1,21 @@
-# Build Cloudflare workerd for linux-arm64 WITHOUT tcmalloc, so it runs on kernels with a
-# 39-bit user virtual address space (Android/Termux proot, Raspberry Pi OS, ChromeOS Crostini).
+# Build upstream Cloudflare workerd for linux-arm64 WITHOUT tcmalloc, so it runs on arm64 kernels
+# with a 39-bit user virtual address space (CONFIG_ARM64_VA_BITS_39), such as ChromeOS's Linux
+# environment. See README.md for what was tested.
 #
-# Why: the npm @cloudflare/workerd-linux-arm64 binaries (every release since 1.20230115.0)
-# statically link tcmalloc, which encodes a memory tag in address bits 42-44 and requires
-# 48-bit VA -> "MmapAligned() failed ... TCMalloc assumes a 48-bit virtual address space".
-# Upstream already has a switch for this (used by its ASAN/TSAN configs):
+# Why: the npm @cloudflare/workerd-linux-arm64 binaries statically link tcmalloc, which needs a
+# 48-bit VA -> "MmapAligned() failed ... TCMalloc assumes a 48-bit virtual address space"
+# (cloudflare/workerd#5020). Upstream already has a switch for this (used by its ASAN/TSAN configs):
 #   --@workerd//src/workerd/server:use_tcmalloc=False   -> falls back to the system (glibc) malloc
 #
-# Usage: put this file at .github/workflows/ in a PUBLIC repo (free ubuntu-24.04-arm = 4 vCPU/16 GB;
-# private repos only get 2 vCPU/8 GB and will likely blow the 6 h job limit), then
-# Actions -> "Build workerd arm64 (no tcmalloc)" -> Run workflow. The workerd_ref must equal the
-# workerd version your wrangler pins (wrangler 4.131.1 -> workerd 1.20260911.1 -> tag v1.20260911.1).
-# A cold build is expected to take ~2.5-4 h. If it times out, just "Re-run jobs": the Bazel disk cache
-# is saved even on failure, so the re-run resumes where it stopped.
+# Run: Actions -> "Build workerd arm64 (no tcmalloc)" -> Run workflow, with workerd_ref set to the
+# workerd version your Wrangler pins (`npm ls workerd` 1.20261101.1 -> tag v1.20261101.1). Tick
+# "release" to publish the binary and its sha256 as a GitHub Release with that tag; the release is
+# made only when the smoke test under an emulated 39-bit address space passed.
+# The repo is public because free ubuntu-24.04-arm runners there have 4 vCPU/16 GB; a cold build
+# takes about 1-4 h. If it times out, "Re-run jobs": the Bazel disk cache is saved even on failure,
+# so the re-run resumes where it stopped.
 #
-# On the phone:
-#   gh run download <run-id> -R <you>/<repo> -n workerd-linux-arm64-notcmalloc-v1.20260911.1 -D ~/workerd-notcmalloc
-#   chmod +x ~/workerd-notcmalloc/workerd
-#   export MINIFLARE_WORKERD_PATH=$HOME/workerd-notcmalloc/workerd
-#   npx wrangler dev
+# Adapted from coolcomfort/workerd-android-arm64, with every action and bazelisk pinned.
 
 name: Build workerd arm64 (no tcmalloc)
 
@@ -26,9 +23,13 @@ on:
   workflow_dispatch:
     inputs:
       workerd_ref:
-        description: "workerd git tag to build; must match wrangler's pinned workerd (e.g. v1.20261102.1)"
+        description: "workerd git tag to build; must match Wrangler's pinned workerd (e.g. v1.20261101.1)"
         required: true
-        default: v1.20261102.1
+        default: v1.20261101.1
+      release:
+        description: "Publish the binary as a GitHub Release tagged workerd_ref (only if the smoke test passes)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -37,6 +38,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
+    outputs:
+      smoke: ${{ steps.smoke.outcome }}
     env:
       REF: ${{ inputs.workerd_ref }}
       CACHE_KEY: bazel-arm64-notcmalloc-${{ inputs.workerd_ref }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -125,10 +128,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # Emulate the phone: an LD_PRELOAD shim reserves every free gap between 2^39 and 2^48 so all
+      # Emulate a 39-bit VA kernel: an LD_PRELOAD shim reserves every free gap between 2^39 and 2^48 so all
       # later mmaps land below 2^39, like a CONFIG_ARM64_VA_BITS_39 kernel. Positive control: the stock
-      # npm binary must die with the same MmapAligned() error seen on the phone.
+      # npm binary must die with the same MmapAligned() error seen on such a device.
       - name: Smoke test under emulated 39-bit address space
+        id: smoke
         continue-on-error: true
         run: |
           set -u
@@ -170,7 +174,7 @@ jobs:
             | tar xz -C stock --strip-components=2 package/bin/workerd
           LD_PRELOAD="$VA39" ./stock/workerd --version > stock.log 2>&1 && echo "stock exit 0" || echo "stock exit $?"
           head -c 600 stock.log; echo
-          if grep -q MmapAligned stock.log; then echo "OK: emulation reproduces the phone crash"
+          if grep -q MmapAligned stock.log; then echo "OK: emulation reproduces the 39-bit VA crash"
           else echo "::warning::emulation did not reproduce the tcmalloc crash; results below are not conclusive"; fi
 
           echo "== new build under the shim"
@@ -217,3 +221,35 @@ jobs:
           kill $P 2>/dev/null || true; wait $P || true
           cat serve.log
           [ -n "$ok" ] || { echo "::error::new build did not serve under emulated 39-bit VA"; exit 1; }
+
+  # A job of its own, so only this job (no Bazel, no upstream code) can write to the repo.
+  release:
+    needs: build
+    if: inputs.release && needs.build.outputs.smoke == 'success'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    env:
+      REF: ${{ inputs.workerd_ref }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: workerd-linux-arm64-notcmalloc-${{ inputs.workerd_ref }}
+          path: out
+
+      - name: Create release
+        working-directory: out
+        run: |
+          [[ "$REF" =~ ^v1\.[0-9]{8}\.[0-9]+$ ]] || { echo "::error::not a workerd release tag: $REF"; exit 1; }
+          chmod +x workerd
+          sha256sum workerd > workerd.sha256
+          cat workerd.sha256
+          gh release create "$REF" workerd workerd.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "workerd $REF without tcmalloc (linux-arm64)" \
+            --notes "Upstream [cloudflare/workerd $REF](https://github.com/cloudflare/workerd/releases/tag/$REF), unpatched, built with \`use_tcmalloc=False\` by [run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) from $GITHUB_SHA. Unofficial; for local development on arm64 kernels with a 39-bit address space.
+
+          sha256: \`$(cut -d' ' -f1 workerd.sha256)\`"

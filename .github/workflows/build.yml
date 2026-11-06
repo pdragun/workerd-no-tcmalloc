@@ -8,7 +8,7 @@
 #   --@workerd//src/workerd/server:use_tcmalloc=False   -> falls back to the system (glibc) malloc
 #
 # Run: Actions -> "Build workerd arm64 (no tcmalloc)" -> Run workflow, with workerd_ref set to the
-# workerd version your Wrangler pins (`npm ls workerd` 1.20261101.1 -> tag v1.20261101.1). Tick
+# newest workerd in your package-lock.json (1.20261102.1 -> tag v1.20261102.1). Tick
 # "release" to publish the binary and its sha256 as a GitHub Release with that tag; the release is
 # made only when the smoke test under an emulated 39-bit address space passed.
 # The repo is public because free ubuntu-24.04-arm runners there have 4 vCPU/16 GB; a cold build
@@ -23,9 +23,9 @@ on:
   workflow_dispatch:
     inputs:
       workerd_ref:
-        description: "workerd git tag to build; must match Wrangler's pinned workerd (e.g. v1.20261101.1)"
+        description: "workerd git tag to build; the newest workerd in your package-lock.json (e.g. v1.20261102.1)"
         required: true
-        default: v1.20261101.1
+        default: v1.20261102.1
       release:
         description: "Publish the binary as a GitHub Release tagged workerd_ref (only if the smoke test passes)"
         type: boolean

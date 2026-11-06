@@ -50,11 +50,17 @@ Reports, working or not, are welcome in Issues.
 ## Builds
 
 Each [release](../../releases) is tagged with the workerd version it was built from (such as
-`v1.20261101.1`) and holds the binary and its sha256. **Use the version your Wrangler pins**
-(`npm ls workerd`); another version may not work with it.
+`v1.20261102.1`) and holds the binary and its sha256. **Use the newest `workerd` in your
+`package-lock.json`**: a project can lock several (Wrangler, the Vitest pool and the Vite plugin each
+pull in their own), and `MINIFLARE_WORKERD_PATH` replaces them all, so match the newest. Another
+version may not work.
 
 ```sh
-gh release download v1.20261101.1 -R pdragun/workerd-no-tcmalloc
+npm ls workerd --all    # pick the highest version listed
+```
+
+```sh
+gh release download v1.20261102.1 -R pdragun/workerd-no-tcmalloc
 sha256sum -c workerd.sha256
 chmod +x workerd
 export MINIFLARE_WORKERD_PATH=$PWD/workerd
